@@ -223,7 +223,7 @@ int main() {
 					intent = "FILE_WRITE";
 				}
 				// Log structured telemetry (matching Section 2.6 spec)
-				fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\"}, \"ppid\":%u}\n",
+				fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
 						timestamp, req.pid, intent, path_buf, get_parent_pid(req.pid));
 				fflush(log_file);
 			}  else {
