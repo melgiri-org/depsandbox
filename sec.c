@@ -14,6 +14,10 @@
 #include <linux/filter.h>
 #include <seccomp.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <sched.h>
+#include <netinet/in.h>
+
 
 pid_t get_parent_pid(pid_t target_pid) {
     char path[64];
@@ -86,7 +90,7 @@ int main() {
         return 1;
     }
 
-    pid_t pid = fork();
+	pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
         return 1;
@@ -101,6 +105,7 @@ int main() {
             exit(1);
         }
 
+		
         // Initialize filter context (Default allow)
         scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
         if (!ctx) {
@@ -114,6 +119,10 @@ int main() {
 		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(clone), 0);
 		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(clone3), 0);
 		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(vfork), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(socket), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(connect), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(sendto), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(send), 0);
 
         if (seccomp_load(ctx) < 0) {
             perror("seccomp_load");
@@ -140,7 +149,7 @@ int main() {
         close(sv[1]);
 
         // Launch target shell / environment
-        char *args[] = {"/bin/unshare", "-U" ,"--net", "-R" ,"root/" ,"/bin/bash", NULL};
+        char *args[] = {"/bin/unshare", "-p", "--map-root-user", "-f", "-U", "-R" ,"root/" ,"/bin/bash", NULL};
         execvp(args[0], args);
         perror("execvp");
         exit(1);
@@ -148,7 +157,7 @@ int main() {
     } else {
         // ==================== PARENT PROCESS (Supervisor) ====================
         close(sv[1]); // Close child socket end
-
+	
         // Receive the notification file descriptor from the child
         int notif_fd = recv_fd(sv[0]);
         close(sv[0]);
@@ -189,7 +198,7 @@ int main() {
 			unsigned long path_ptr = 0;
 			unsigned long flags = 0;
 
-			printf("%d\n", req.data.nr);
+			// printf("%d\n", req.data.nr);
 
 			time_t now = time(NULL);
 			struct tm *t = gmtime(&now);
@@ -203,7 +212,42 @@ int main() {
 				} else if (req.data.nr == SCMP_SYS(openat)) {
 					path_ptr = req.data.args[1];
 					flags = req.data.args[2];
+				} else if (req.data.nr == SCMP_SYS(socket)) {
+					unsigned long type = req.data.args[1];
+					const char *proto = "UNKNOWN";
+					if (type == 1) proto = "TCP (SOCK_STREAM)";
+					else if (type == 2) proto = "UDP (SOCK_DGRAM)";
+					else if (type == 3) proto = "RAW/ICMP";
+
+					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"ppid\": %d, \"event\": \"SOCKET_CREATE\", \"protocol\": \"%s\"}\n",
+							timestamp, req.pid, get_parent_pid(req.pid), proto);
+					fflush(log_file);
+				} else if (req.data.nr == SCMP_SYS(connect)) {
+					unsigned long addr_ptr = req.data.args[1];
+
+					struct sockaddr_in sa = {0};
+					if (addr_ptr != 0) {
+						struct iovec local_iov = { .iov_base = &sa, .iov_len = sizeof(sa) };
+						struct iovec remote_iov = { .iov_base = (void *)addr_ptr, .iov_len = sizeof(sa) };
+						process_vm_readv(req.pid, &local_iov, 1, &remote_iov, 1, 0);
+					}
+
+					// Convert IP and Port from network byte order
+					char ip_str[INET_ADDRSTRLEN] = {0};
+					inet_ntop(AF_INET, &(sa.sin_addr), ip_str, INET_ADDRSTRLEN);
+					int port = ntohs(sa.sin_port);
+
+					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"ppid\": %d, \"event\": \"CONNECT\", \"dest_ip\": \"%s\", \"dest_port\": %d}\n",
+							timestamp, req.pid, get_parent_pid(req.pid), ip_str, port);
+					fflush(log_file);
+				} else if (req.data.nr == SCMP_SYS(sendto) || req.data.nr == SCMP_SYS(send)) {
+					size_t payload_size = (size_t)req.data.args[0];
+
+					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"ppid\": %d, \"event\": \"DATA_TRANSMIT\", \"payload_bytes\": %zu}\n",
+							timestamp, req.pid, get_parent_pid(req.pid), payload_size);
+					fflush(log_file);
 				}
+
 
 				char path_buf[256] = {0};
 				if (path_ptr != 0) {
@@ -219,13 +263,15 @@ int main() {
 				const char *intent = "UNKNOWN";
 				if (access_mode == O_RDONLY) {
 					intent = "FILE_READ";
+					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
+							timestamp, req.pid, intent, path_buf, get_parent_pid(req.pid));
+					fflush(log_file);
 				} else if (access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT)) {
 					intent = "FILE_WRITE";
-				}
-				// Log structured telemetry (matching Section 2.6 spec)
-				fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
-						timestamp, req.pid, intent, path_buf, get_parent_pid(req.pid));
-				fflush(log_file);
+					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
+							timestamp, req.pid, intent, path_buf, get_parent_pid(req.pid));
+					fflush(log_file);
+				}				// Log structured telemetry (matching Section 2.6 spec)
 			}  else {
 				fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"CLONE\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
 						timestamp, req.pid, get_parent_pid(req.pid));
