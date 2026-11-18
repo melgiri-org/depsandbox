@@ -1,23 +1,25 @@
 #define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/seccomp.h>
-#include <netinet/in.h>
-#include <seccomp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
+#include <unistd.h>
+#include <errno.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 #include <sys/wait.h>
-#include <time.h>
-#include <unistd.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <seccomp.h>
+#include <arpa/inet.h>
+#include <sched.h>
+#include <netinet/in.h>
 
-static void log_json_string(FILE *file, const char *value)
-{
+
+// Escape a pathname before writing it into a JSON string.
+static void log_json_string(FILE *file, const char *value) {
     fputc('"', file);
     for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
         if (*p == '"' || *p == '\\') {
@@ -32,302 +34,287 @@ static void log_json_string(FILE *file, const char *value)
     fputc('"', file);
 }
 
-static pid_t get_parent_pid(pid_t pid)
-{
+pid_t get_parent_pid(pid_t target_pid) {
     char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-
-    FILE *file = fopen(path, "r");
-    if (!file)
-        return -1;
+    snprintf(path, sizeof(path), "/proc/%d/status", target_pid);
+    
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
 
     char line[128];
-    pid_t parent = -1;
-    while (fgets(line, sizeof(line), file)) {
+    pid_t ppid = -1;
+
+    // Read through the status file line by line looking for "PPid:"
+    while (fgets(line, sizeof(line), f)) {
         if (strncmp(line, "PPid:", 5) == 0) {
-            sscanf(line + 5, "%d", &parent);
+            sscanf(line + 5, "%d", &ppid);
             break;
         }
     }
-    fclose(file);
-    return parent;
+    fclose(f);
+    return ppid;
 }
 
-static int send_fd(int socket_fd, int fd)
-{
-    char byte = ' ';
-    struct iovec data = { .iov_base = &byte, .iov_len = 1 };
-    union {
-        struct cmsghdr alignment;
-        unsigned char bytes[CMSG_SPACE(sizeof(int))];
-    } control = {0};
+// Helper function to send a file descriptor over a UNIX domain socket
+int send_fd(int socket, int fd) {
+    struct msghdr msg = {0};
+    struct cmsghdr *cmsg;
+    char buf[CMSG_SPACE(sizeof(int))] = {0};
+    char dummy = ' ';
+    struct iovec io = { &dummy, 1 };
 
-    struct msghdr message = {
-        .msg_iov = &data,
-        .msg_iovlen = 1,
-        .msg_control = control.bytes,
-        .msg_controllen = sizeof(control.bytes)
-    };
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
 
-    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
-    header->cmsg_level = SOL_SOCKET;
-    header->cmsg_type = SCM_RIGHTS;
-    header->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(header), &fd, sizeof(fd));
-    return sendmsg(socket_fd, &message, 0);
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    *((int *)CMSG_DATA(cmsg)) = fd;
+
+    return sendmsg(socket, &msg, 0);
 }
 
-static int recv_fd(int socket_fd)
-{
-    char byte;
-    struct iovec data = { .iov_base = &byte, .iov_len = 1 };
-    union {
-        struct cmsghdr alignment;
-        unsigned char bytes[CMSG_SPACE(sizeof(int))];
-    } control = {0};
+// Helper function to receive a file descriptor over a UNIX domain socket
+int recv_fd(int socket) {
+    struct msghdr msg = {0};
+    struct cmsghdr *cmsg;
+    char buf[CMSG_SPACE(sizeof(int))] = {0};
+    char dummy;
+    struct iovec io = { &dummy, 1 };
 
-    struct msghdr message = {
-        .msg_iov = &data,
-        .msg_iovlen = 1,
-        .msg_control = control.bytes,
-        .msg_controllen = sizeof(control.bytes)
-    };
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
 
-    if (recvmsg(socket_fd, &message, 0) <= 0)
-        return -1;
+    if (recvmsg(socket, &msg, 0) < 0) return -1;
 
-    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
-    if (!header || header->cmsg_level != SOL_SOCKET ||
-        header->cmsg_type != SCM_RIGHTS ||
-        header->cmsg_len < CMSG_LEN(sizeof(int))) {
-        return -1;
-    }
+    cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return -1;
 
-    int fd;
-    memcpy(&fd, CMSG_DATA(header), sizeof(fd));
-    return fd;
+    return *((int *)CMSG_DATA(cmsg));
 }
 
-static void log_syscall(FILE *file, const struct seccomp_notif *req)
-{
-    unsigned int pid = req->pid;
-    pid_t parent = get_parent_pid(pid);
-    int syscall_number = req->data.nr;
-
-    time_t now = time(NULL);
-    struct tm *utc = gmtime(&now);
-    char timestamp[64] = "";
-    if (utc)
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", utc);
-
-    if (syscall_number == SCMP_SYS(clone) ||
-        syscall_number == SCMP_SYS(clone3) ||
-        syscall_number == SCMP_SYS(vfork)) {
-        fprintf(file,
-                "{\"timestamp\":\"%s\",\"pid\":%u,\"ppid\":%d,"
-                "\"intent\":\"CLONE\",\"action\":\"ALLOW\"}\n",
-                timestamp, pid, parent);
-    } else if (syscall_number == SCMP_SYS(openat) ||
-               syscall_number == SCMP_SYS(unlinkat)) {
-        const char *intent = "FILE_DELETE";
-
-        if (syscall_number == SCMP_SYS(openat)) {
-            unsigned long flags = req->data.args[2];
-            unsigned long mode = flags & O_ACCMODE;
-            intent = (mode == O_WRONLY || mode == O_RDWR ||
-                      (flags & (O_CREAT | O_TRUNC)))
-                         ? "FILE_WRITE" : "FILE_READ";
-        }
-
-        char path[256] = {0};
-        if (req->data.args[1] != 0) {
-            struct iovec local = { .iov_base = path, .iov_len = sizeof(path) };
-            struct iovec remote = {
-                .iov_base = (void *)req->data.args[1],
-                .iov_len = sizeof(path)
-            };
-            ssize_t bytes = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-            if (bytes <= 0 || !memchr(path, '\0', (size_t)bytes))
-                path[0] = '\0';
-        }
-
-        fprintf(file,
-                "{\"timestamp\":\"%s\",\"pid\":%u,\"ppid\":%d,"
-                "\"intent\":\"%s\",\"path\":",
-                timestamp, pid, parent, intent);
-        log_json_string(file, path);
-        fputs(",\"action\":\"ALLOW\"}\n", file);
-    } else if (syscall_number == SCMP_SYS(socket)) {
-        unsigned long type = req->data.args[1];
-        type &= ~(unsigned long)(SOCK_CLOEXEC | SOCK_NONBLOCK);
-
-        const char *protocol = "UNKNOWN";
-        if (type == SOCK_STREAM)
-            protocol = "TCP (SOCK_STREAM)";
-        else if (type == SOCK_DGRAM)
-            protocol = "UDP (SOCK_DGRAM)";
-        else if (type == SOCK_RAW)
-            protocol = "RAW/ICMP";
-
-        fprintf(file,
-                "{\"timestamp\":\"%s\",\"pid\":%u,\"ppid\":%d,"
-                "\"event\":\"SOCKET_CREATE\",\"protocol\":\"%s\"}\n",
-                timestamp, pid, parent, protocol);
-    } else if (syscall_number == SCMP_SYS(connect)) {
-        struct sockaddr_in address = {0};
-        char ip[INET_ADDRSTRLEN] = "";
-        int port = 0;
-
-        if (req->data.args[1] != 0 &&
-            req->data.args[2] >= sizeof(address)) {
-            struct iovec local = {
-                .iov_base = &address, .iov_len = sizeof(address)
-            };
-            struct iovec remote = {
-                .iov_base = (void *)req->data.args[1],
-                .iov_len = sizeof(address)
-            };
-            ssize_t bytes = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-            if (bytes == (ssize_t)sizeof(address) &&
-                address.sin_family == AF_INET) {
-                inet_ntop(AF_INET, &address.sin_addr, ip, sizeof(ip));
-                port = ntohs(address.sin_port);
-            }
-        }
-
-        fprintf(file,
-                "{\"timestamp\":\"%s\",\"pid\":%u,\"ppid\":%d,"
-                "\"event\":\"CONNECT\",\"dest_ip\":\"%s\",\"dest_port\":%d}\n",
-                timestamp, pid, parent, ip, port);
-    } else if (syscall_number == SCMP_SYS(sendto) ||
-               syscall_number == SCMP_SYS(send)) {
-        fprintf(file,
-                "{\"timestamp\":\"%s\",\"pid\":%u,\"ppid\":%d,"
-                "\"event\":\"DATA_TRANSMIT\",\"payload_bytes\":%zu}\n",
-                timestamp, pid, parent, (size_t)req->data.args[2]);
-    }
-
-    fflush(file);
-}
-
-int main(void)
-{
-    int sockets[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) < 0) {
+int main() {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
         perror("socketpair");
         return 1;
     }
 
-    pid_t pid = fork();
+	pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        close(sockets[0]);
-        close(sockets[1]);
         return 1;
     }
 
     if (pid == 0) {
-        close(sockets[0]);
+        // ==================== CHILD PROCESS (Sandbox) ====================
+        close(sv[0]); // Close parent socket end
 
-        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
-            perror("prctl");
-            _exit(1);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+            perror("prctl(NO_NEW_PRIVS)");
+            exit(1);
         }
 
-        scmp_filter_ctx filter = seccomp_init(SCMP_ACT_ALLOW);
-        if (!filter) {
+		
+        // Initialize filter context (Default allow)
+        scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
+        if (!ctx) {
             perror("seccomp_init");
-            _exit(1);
+            exit(1);
         }
 
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(unlinkat), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(openat), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(clone), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(clone3), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(vfork), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(socket), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(connect), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(sendto), 0);
-        seccomp_rule_add(filter, SCMP_ACT_NOTIFY, SCMP_SYS(send), 0);
+        // Add rules to intercept unlink and unlinkat via User Notifications
+        seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(unlinkat), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(openat), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(clone), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(clone3), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(vfork), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(socket), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(connect), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(sendto), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(send), 0);
 
-        int result = seccomp_load(filter);
-        if (result < 0) {
-            fprintf(stderr, "seccomp_load: %s\n", strerror(-result));
-            seccomp_release(filter);
-            _exit(1);
+        if (seccomp_load(ctx) < 0) {
+            perror("seccomp_load");
+            seccomp_release(ctx);
+            exit(1);
         }
 
-        int listener = seccomp_notify_fd(filter);
-        if (listener < 0 || send_fd(sockets[1], listener) < 0) {
-            fprintf(stderr, "Could not send the seccomp listener to the supervisor\n");
-            seccomp_release(filter);
-            _exit(1);
-        }
-        seccomp_release(filter);
-        close(listener);
-        close(sockets[1]);
+        // Export the kernel notification file descriptor
+        int notif_fd = seccomp_notify_fd(ctx);
+        seccomp_release(ctx);
 
-        char *args[] = {
-            "/bin/unshare", "-p", "--map-root-user", "-f", "-U",
-            "-R", "root/", "/bin/bash", NULL
-        };
+        if (notif_fd < 0) {
+            perror("seccomp_export_notif_fd");
+            exit(1);
+        }
+
+        // Send notif_fd to the parent supervisor process
+        if (send_fd(sv[1], notif_fd) < 0) {
+            perror("send_fd");
+            close(notif_fd);
+            exit(1);
+        }
+        close(notif_fd);
+        close(sv[1]);
+
+        // Launch target shell / environment
+        char *args[] = {"/bin/unshare", "-p", "--map-root-user", "-f", "-U", "-R" ,"root/" ,"/bin/bash", NULL};
         execvp(args[0], args);
         perror("execvp");
-        _exit(1);
-    }
+        exit(1);
 
-    close(sockets[1]);
-    int listener = recv_fd(sockets[0]);
-    close(sockets[0]);
-    if (listener < 0) {
-        fprintf(stderr, "Could not receive the seccomp listener\n");
-        waitpid(pid, NULL, 0);
-        return 1;
-    }
+    } else {
+        // ==================== PARENT PROCESS (Supervisor) ====================
+        close(sv[1]); // Close child socket end
+	
+        // Receive the notification file descriptor from the child
+        int notif_fd = recv_fd(sv[0]);
+        close(sv[0]);
 
-    FILE *file = fopen("depsandbox.log", "a");
-    if (!file) {
-        perror("fopen depsandbox.log");
-        close(listener);
-        waitpid(pid, NULL, 0);
-        return 1;
-    }
-
-    fprintf(file, "[depsandbox_log] [INFO] Supervisor active for child PID %d\n", pid);
-    fflush(file);
-
-    for (;;) {
-        struct seccomp_notif request = {0};
-        if (ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, &request) < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-
-        log_syscall(file, &request);
-
-        struct seccomp_notif_resp response = {
-            .id = request.id,
-            .flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE
-        };
-        if (ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &response) < 0) {
-            if (errno == ENOENT)
-                continue;
-            break;
-        }
-    }
-
-    close(listener);
-    int status;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            perror("waitpid");
-            fclose(file);
+        if (notif_fd < 0) {
+            perror("recv_fd failed");
+            waitpid(pid, NULL, 0);
             return 1;
         }
+
+        // Open local telemetry log file
+        FILE *log_file = fopen("depsandbox.log", "a");
+        if (!log_file) {
+            perror("fopen depsandbox.log");
+            close(notif_fd);
+            return 1;
+        }
+
+        fprintf(log_file, "[depsandbox_log] [INFO] Supervisor active for child PID %d, listening for syscall notifications...\n", pid);
+        fflush(log_file);
+
+        // Supervisor Event Loop
+        struct seccomp_notif req;
+        struct seccomp_notif_resp resp;
+
+        while (1) {
+			memset(&req, 0, sizeof(req));
+            // Wait for child syscall notification from the kerne
+            if (ioctl(notif_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) {
+                if (errno == EINTR) continue;
+                // If child exits, ioctl returns ENOENT or ENODEV
+                break;
+            }
+
+			// Determine path argument position based on syscall number
+			// unlink(pathname) -> args[0]
+			// unlinkat(dirfd, pathname, flags) -> args[1]
+			unsigned long path_ptr = 0;
+			unsigned long flags = 0;
+
+			// printf("%d\n", req.data.nr);
+
+
+
+			if (req.data.nr != SCMP_SYS(clone) || req.data.nr != SCMP_SYS(vfork) || req.data.nr != SCMP_SYS(clone3)){
+				if (req.data.nr == SCMP_SYS(unlinkat)) {
+					path_ptr = req.data.args[1];
+				} else if (req.data.nr == SCMP_SYS(openat)) {
+					path_ptr = req.data.args[1];
+					flags = req.data.args[2];
+				} else if (req.data.nr == SCMP_SYS(socket)) {
+					unsigned long type = req.data.args[1];
+					const char *proto = "UNKNOWN";
+					if (type == 1) proto = "TCP (SOCK_STREAM)";
+					else if (type == 2) proto = "UDP (SOCK_DGRAM)";
+					else if (type == 3) proto = "RAW/ICMP";
+
+					fprintf(log_file, "{\"pid\": %d, \"ppid\": %d, \"event\": \"SOCKET_CREATE\", \"protocol\": \"%s\"}\n",
+							req.pid, get_parent_pid(req.pid), proto);
+					fflush(log_file);
+				} else if (req.data.nr == SCMP_SYS(connect)) {
+					unsigned long addr_ptr = req.data.args[1];
+
+					struct sockaddr_in sa = {0};
+					if (addr_ptr != 0) {
+						struct iovec local_iov = { .iov_base = &sa, .iov_len = sizeof(sa) };
+						struct iovec remote_iov = { .iov_base = (void *)addr_ptr, .iov_len = sizeof(sa) };
+						process_vm_readv(req.pid, &local_iov, 1, &remote_iov, 1, 0);
+					}
+
+					// Convert IP and Port from network byte order
+					char ip_str[INET_ADDRSTRLEN] = {0};
+					inet_ntop(AF_INET, &(sa.sin_addr), ip_str, INET_ADDRSTRLEN);
+					int port = ntohs(sa.sin_port);
+
+					fprintf(log_file, "{\"pid\": %d, \"ppid\": %d, \"event\": \"CONNECT\", \"dest_ip\": \"%s\", \"dest_port\": %d}\n",
+							req.pid, get_parent_pid(req.pid), ip_str, port);
+					fflush(log_file);
+				} else if (req.data.nr == SCMP_SYS(sendto) || req.data.nr == SCMP_SYS(send)) {
+					size_t payload_size = (size_t)req.data.args[0];
+
+					fprintf(log_file, "{\"pid\": %d, \"ppid\": %d, \"event\": \"DATA_TRANSMIT\", \"payload_bytes\": %zu}\n",
+							req.pid, get_parent_pid(req.pid), payload_size);
+					fflush(log_file);
+				}
+
+
+				char path_buf[256] = {0};
+				if (path_ptr != 0) {
+					struct iovec local_iov = { .iov_base = path_buf, .iov_len = sizeof(path_buf) - 1 };
+					struct iovec remote_iov = { .iov_base = (void *)path_ptr, .iov_len = sizeof(path_buf) - 1 };
+					process_vm_readv(req.pid, &local_iov, 1, &remote_iov, 1, 0);
+				}
+
+
+				// Determine if intent is Read or Write based on open flags
+				// (O_ACCMODE mask extracts O_RDONLY (0), O_WRONLY (1), or O_RDWR (2))
+				int access_mode = flags & O_ACCMODE;
+				const char *intent = "UNKNOWN";
+				if (access_mode == O_RDONLY) {
+					intent = "FILE_READ";
+					fprintf(log_file, "{\"pid\": %d, \"intent\": \"%s\", \"path\": ",
+							req.pid, intent);
+					log_json_string(log_file, path_buf);
+					fprintf(log_file, ", \"ppid\":%u}\n", get_parent_pid(req.pid));
+					fflush(log_file);
+				} else if (access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT)) {
+					intent = "FILE_WRITE";
+					fprintf(log_file, "{\"pid\": %d, \"intent\": \"%s\", \"path\": ",
+							req.pid, intent);
+					log_json_string(log_file, path_buf);
+					fprintf(log_file, ", \"ppid\":%u}\n", get_parent_pid(req.pid));
+					fflush(log_file);
+				}				// Log structured telemetry (matching Section 2.6 spec)
+			}  else {
+				fprintf(log_file, "{\"pid\": %d, \"intent\": \"CLONE\", \"ppid\":%u}\n",
+						req.pid, get_parent_pid(req.pid));
+				fflush(log_file);
+			}
+
+
+			// Prepare response: allow the syscall to proceed normally
+			memset(&resp, 0, sizeof(resp));
+			resp.id = req.id;
+			resp.val = 0; // Return 0 (success)
+			resp.error = 0;
+			resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE; // Let kernel execute the call
+
+			if (ioctl(notif_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0) {
+				// If child died concurrently, send might fail
+				if (errno == ENOENT) continue;
+				break;
+			}
+		}
+
+        // Clean up
+        waitpid(pid, NULL, 0);
+        fprintf(log_file, "[depsandbox_log] [INFO] Child process exited. Supervisor shutting down.\n");
+        fclose(log_file);
+        close(notif_fd);
+		// TODO: Analysis
     }
 
-    fputs("[depsandbox_log] [INFO] Child process exited\n", file);
-    fclose(file);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    return 0;
 }
