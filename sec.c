@@ -13,11 +13,26 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <seccomp.h>
-#include <time.h>
 #include <arpa/inet.h>
 #include <sched.h>
 #include <netinet/in.h>
 
+
+// Escape a pathname before writing it into a JSON string.
+static void log_json_string(FILE *file, const char *value) {
+    fputc('"', file);
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            fputc('\\', file);
+            fputc(*p, file);
+        } else if (*p < 0x20) {
+            fprintf(file, "\\u%04x", (unsigned int)*p);
+        } else {
+            fputc(*p, file);
+        }
+    }
+    fputc('"', file);
+}
 
 pid_t get_parent_pid(pid_t target_pid) {
     char path[64];
@@ -200,10 +215,6 @@ int main() {
 
 			// printf("%d\n", req.data.nr);
 
-			time_t now = time(NULL);
-			struct tm *t = gmtime(&now);
-			char timestamp[64];
-			strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", t);
 
 
 			if (req.data.nr != SCMP_SYS(clone) || req.data.nr != SCMP_SYS(vfork) || req.data.nr != SCMP_SYS(clone3)){
@@ -219,8 +230,8 @@ int main() {
 					else if (type == 2) proto = "UDP (SOCK_DGRAM)";
 					else if (type == 3) proto = "RAW/ICMP";
 
-					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"ppid\": %d, \"event\": \"SOCKET_CREATE\", \"protocol\": \"%s\"}\n",
-							timestamp, req.pid, get_parent_pid(req.pid), proto);
+					fprintf(log_file, "{\"pid\": %d, \"ppid\": %d, \"event\": \"SOCKET_CREATE\", \"protocol\": \"%s\"}\n",
+							req.pid, get_parent_pid(req.pid), proto);
 					fflush(log_file);
 				} else if (req.data.nr == SCMP_SYS(connect)) {
 					unsigned long addr_ptr = req.data.args[1];
@@ -237,14 +248,14 @@ int main() {
 					inet_ntop(AF_INET, &(sa.sin_addr), ip_str, INET_ADDRSTRLEN);
 					int port = ntohs(sa.sin_port);
 
-					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"ppid\": %d, \"event\": \"CONNECT\", \"dest_ip\": \"%s\", \"dest_port\": %d}\n",
-							timestamp, req.pid, get_parent_pid(req.pid), ip_str, port);
+					fprintf(log_file, "{\"pid\": %d, \"ppid\": %d, \"event\": \"CONNECT\", \"dest_ip\": \"%s\", \"dest_port\": %d}\n",
+							req.pid, get_parent_pid(req.pid), ip_str, port);
 					fflush(log_file);
 				} else if (req.data.nr == SCMP_SYS(sendto) || req.data.nr == SCMP_SYS(send)) {
 					size_t payload_size = (size_t)req.data.args[0];
 
-					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"ppid\": %d, \"event\": \"DATA_TRANSMIT\", \"payload_bytes\": %zu}\n",
-							timestamp, req.pid, get_parent_pid(req.pid), payload_size);
+					fprintf(log_file, "{\"pid\": %d, \"ppid\": %d, \"event\": \"DATA_TRANSMIT\", \"payload_bytes\": %zu}\n",
+							req.pid, get_parent_pid(req.pid), payload_size);
 					fflush(log_file);
 				}
 
@@ -263,18 +274,22 @@ int main() {
 				const char *intent = "UNKNOWN";
 				if (access_mode == O_RDONLY) {
 					intent = "FILE_READ";
-					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
-							timestamp, req.pid, intent, path_buf, get_parent_pid(req.pid));
+					fprintf(log_file, "{\"pid\": %d, \"intent\": \"%s\", \"path\": ",
+							req.pid, intent);
+					log_json_string(log_file, path_buf);
+					fprintf(log_file, ", \"ppid\":%u}\n", get_parent_pid(req.pid));
 					fflush(log_file);
 				} else if (access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT)) {
 					intent = "FILE_WRITE";
-					fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"%s\", \"path\": \"%s\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
-							timestamp, req.pid, intent, path_buf, get_parent_pid(req.pid));
+					fprintf(log_file, "{\"pid\": %d, \"intent\": \"%s\", \"path\": ",
+							req.pid, intent);
+					log_json_string(log_file, path_buf);
+					fprintf(log_file, ", \"ppid\":%u}\n", get_parent_pid(req.pid));
 					fflush(log_file);
 				}				// Log structured telemetry (matching Section 2.6 spec)
 			}  else {
-				fprintf(log_file, "{\"timestamp\": \"%s\", \"pid\": %d, \"intent\": \"CLONE\", \"action\": \"ALLOW\", \"ppid\":%u}\n",
-						timestamp, req.pid, get_parent_pid(req.pid));
+				fprintf(log_file, "{\"pid\": %d, \"intent\": \"CLONE\", \"ppid\":%u}\n",
+						req.pid, get_parent_pid(req.pid));
 				fflush(log_file);
 			}
 

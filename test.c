@@ -1,31 +1,48 @@
+#include <errno.h>
 #include <stdio.h>
-#include <sys/types.h>
-#include <wait.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-int main(){
-	pid_t p = fork();
+int main(void)
+{
+    pid_t child = fork();
+    if (child < 0) {
+        perror("fork");
+        return 1;
+    }
 
-	if(p == 0){
-		printf("child\n");
-		FILE *f = fopen("/home/cicd/.npm/sign", "r");
-		char buffer[256];
+    if (child == 0) {
+        puts("child");
+        FILE *file = fopen("/etc/hostname", "r");
+        if (!file) {
+            perror("fopen /etc/hostname");
+            return 1;
+        }
 
-		if (f == NULL) {
-			printf("Error opening file.\n");
-		}
-		// 2. Read line by line until the end of the file (EOF)
-		while (fgets(buffer, sizeof(buffer), f) != NULL) {
-			printf("%s", buffer);
-		}
-		fclose(f);
-	}
-	else {
-		printf("Parent\n");
-		// wait(NULL);
+        char line[256];
+        while (fgets(line, sizeof(line), file))
+            fputs(line, stdout);
 
-		FILE *f = fopen("/bin/ls", "r");
-		fclose(f);	
-	}
-	return 0;
+        int failed = ferror(file);
+        fclose(file);
+        return failed ? 1 : 0;
+    }
+
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            perror("waitpid");
+            return 1;
+        }
+    }
+
+    puts("Parent");
+    FILE *file = fopen("/bin/ls", "r");
+    if (!file) {
+        perror("fopen /bin/ls");
+        return 1;
+    }
+    fclose(file);
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
